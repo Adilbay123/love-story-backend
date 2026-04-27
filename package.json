@@ -1,4 +1,4 @@
-{
+{  
   "name": "love-story-backend",
   "version": "1.0.0",
   "main": "server.js",
@@ -16,4 +16,4 @@
     "nodemailer": "^6.9.7",
     "dotenv": "^16.3.1"
   }
-}
+} 

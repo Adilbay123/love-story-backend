@@ -7,18 +7,23 @@ const multer = require('multer');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config();
 
 const app = express();
+
+// Создаём папку uploads, если её нет (для Render)
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+}
 
 app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static('uploads'));
 
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, 'uploads/'),
-    filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
-});
+// Multer с временным хранилищем в памяти (для Render)
+const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
 // MongoDB
@@ -53,11 +58,14 @@ cloudinary.config({
     api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// Email
-const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
-});
+// Email (если не настроен — не падает)
+let transporter = null;
+if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+    transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+    });
+}
 
 function generateToken(userId) {
     return jwt.sign({ userId }, process.env.JWT_SECRET, { expiresIn: '7d' });
@@ -71,35 +79,62 @@ app.get('/', (req, res) => {
 app.post('/api/register', async (req, res) => {
     try {
         const { email, password } = req.body;
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Email и пароль обязательны' });
+        }
+        const existingUser = await User.findOne({ email });
+        if (existingUser) {
+            return res.status(400).json({ error: 'Email уже используется' });
+        }
         const hashedPassword = await bcrypt.hash(password, 10);
         const user = await User.create({ email, password: hashedPassword });
         res.json({ token: generateToken(user._id), user: { email: user.email, storageUsed: 0 } });
     } catch (error) {
-        res.status(400).json({ error: 'Email уже используется' });
+        console.error('Register error:', error);
+        res.status(500).json({ error: 'Ошибка сервера' });
     }
 });
 
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
+        if (!email || !password) {
+            return res.status(400).json({ error: 'Email и пароль обязательны' });
+        }
         const user = await User.findOne({ email });
         if (!user || !(await bcrypt.compare(password, user.password))) {
             return res.status(401).json({ error: 'Неверный email или пароль' });
         }
         res.json({ token: generateToken(user._id), user: { email: user.email, storageUsed: user.totalStorageUsed } });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        console.error('Login error:', error);
+        res.status(500).json({ error: 'Ошибка сервера' });
     }
 });
 
 app.post('/api/photos', upload.single('photo'), async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
+        if (!token) return res.status(401).json({ error: 'Нет токена' });
+        
         const { userId } = jwt.verify(token, process.env.JWT_SECRET);
         const user = await User.findById(userId);
         if (!user) return res.status(401).json({ error: 'Не авторизован' });
 
-        const result = await cloudinary.uploader.upload(req.file.path, { folder: `user_${userId}` });
+        if (!req.file) return res.status(400).json({ error: 'Нет файла' });
+
+        // Загружаем в Cloudinary из буфера памяти
+        const result = await new Promise((resolve, reject) => {
+            const stream = cloudinary.uploader.upload_stream(
+                { folder: `user_${userId}` },
+                (error, result) => {
+                    if (error) reject(error);
+                    else resolve(result);
+                }
+            );
+            stream.end(req.file.buffer);
+        });
+
         const photo = await Photo.create({
             userId, url: result.secure_url, publicId: result.public_id,
             caption: req.body.caption || '', sizeBytes: result.bytes
@@ -108,18 +143,22 @@ app.post('/api/photos', upload.single('photo'), async (req, res) => {
         await user.save();
         res.json({ photo, storageUsed: user.totalStorageUsed, storageLimit: 2_000_000_000 });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        console.error('Upload error:', error);
+        res.status(500).json({ error: error.message || 'Ошибка загрузки' });
     }
 });
 
 app.get('/api/photos', async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
+        if (!token) return res.status(401).json({ error: 'Нет токена' });
+        
         const { userId } = jwt.verify(token, process.env.JWT_SECRET);
         const photos = await Photo.find({ userId }).sort({ createdAt: -1 });
         const user = await User.findById(userId);
         res.json({ photos, storageUsed: user.totalStorageUsed, storageLimit: 2_000_000_000 });
     } catch (error) {
+        console.error('Get photos error:', error);
         res.status(401).json({ error: 'Не авторизован' });
     }
 });
@@ -127,29 +166,41 @@ app.get('/api/photos', async (req, res) => {
 app.delete('/api/photos/:id', async (req, res) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
+        if (!token) return res.status(401).json({ error: 'Нет токена' });
+        
         const { userId } = jwt.verify(token, process.env.JWT_SECRET);
         const photo = await Photo.findOne({ _id: req.params.id, userId });
         if (!photo) return res.status(404).json({ error: 'Фото не найдено' });
+        
         await cloudinary.uploader.destroy(photo.publicId);
         await photo.deleteOne();
+        
         const user = await User.findById(userId);
         user.totalStorageUsed -= photo.sizeBytes;
         await user.save();
         res.json({ success: true, storageUsed: user.totalStorageUsed });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        console.error('Delete error:', error);
+        res.status(500).json({ error: 'Ошибка удаления' });
     }
 });
 
 app.post('/api/forgot-password', async (req, res) => {
-    const { email } = req.body;
-    const user = await User.findOne({ email });
-    if (!user) return res.json({ message: 'Если email существует, код отправлен' });
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    user.resetCode = await bcrypt.hash(code, 10);
-    user.resetCodeExpires = Date.now() + 3600000;
-    await user.save();
     try {
+        const { email } = req.body;
+        const user = await User.findOne({ email });
+        if (!user) return res.json({ message: 'Если email существует, код отправлен' });
+        
+        const code = Math.floor(100000 + Math.random() * 900000).toString();
+        user.resetCode = await bcrypt.hash(code, 10);
+        user.resetCodeExpires = Date.now() + 3600000;
+        await user.save();
+        
+        // Если email не настроен, показываем код в ответе
+        if (!transporter) {
+            return res.json({ message: 'Код для восстановления', code, demo: true });
+        }
+        
         await transporter.sendMail({
             from: `"Love Story" <${process.env.EMAIL_USER}>`,
             to: email,
@@ -158,23 +209,29 @@ app.post('/api/forgot-password', async (req, res) => {
         });
         res.json({ message: 'Код отправлен на email' });
     } catch (error) {
-        res.json({ message: 'Ошибка отправки', code });
+        console.error('Forgot error:', error);
+        res.json({ message: 'Ошибка', code: '123456' });
     }
 });
 
 app.post('/api/reset-password', async (req, res) => {
-    const { email, code, newPassword } = req.body;
-    const user = await User.findOne({ email });
-    if (!user || !user.resetCode || user.resetCodeExpires < Date.now()) {
-        return res.status(400).json({ error: 'Код недействителен' });
+    try {
+        const { email, code, newPassword } = req.body;
+        const user = await User.findOne({ email });
+        if (!user || !user.resetCode || user.resetCodeExpires < Date.now()) {
+            return res.status(400).json({ error: 'Код недействителен' });
+        }
+        if (!(await bcrypt.compare(code, user.resetCode))) {
+            return res.status(400).json({ error: 'Неверный код' });
+        }
+        user.password = await bcrypt.hash(newPassword, 10);
+        user.resetCode = null;
+        await user.save();
+        res.json({ message: 'Пароль изменён' });
+    } catch (error) {
+        console.error('Reset error:', error);
+        res.status(500).json({ error: 'Ошибка' });
     }
-    if (!(await bcrypt.compare(code, user.resetCode))) {
-        return res.status(400).json({ error: 'Неверный код' });
-    }
-    user.password = await bcrypt.hash(newPassword, 10);
-    user.resetCode = null;
-    await user.save();
-    res.json({ message: 'Пароль изменён' });
 });
 
 const PORT = process.env.PORT || 5000;
